@@ -4,11 +4,7 @@ Simple Windows app for translating `.srt` subtitle files with Gemini.
 
 ## Download
 
-Download v1.0.0:
-
-```text
-https://github.com/Nom1fan/gemini-srt-translator/releases/download/v1.0.0/GeminiSrtTranslator-v1.0.0.zip
-```
+[Download v1.0.0](https://github.com/Nom1fan/gemini-srt-translator/releases/download/v1.0.0/GeminiSrtTranslator-v1.0.0.zip)
 
 ## What It Does
 
