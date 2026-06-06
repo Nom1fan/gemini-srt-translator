@@ -1,0 +1,10 @@
+*.zip
+*.log
+*.tmp
+*.bak
+*.eng.srt
+*.heb.srt
+*.en.srt
+*.he.srt
+.DS_Store
+Thumbs.db
