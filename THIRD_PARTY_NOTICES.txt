@@ -1,0 +1,15 @@
+AI Subtitle Toolkit release packages include FFmpeg executables:
+
+- ffmpeg.exe
+- ffprobe.exe
+
+The bundled Windows build is the FFmpeg 8.1.1 essentials build from GyanD/codexffmpeg.
+
+FFmpeg is free software licensed under the GNU General Public License version 3 or later.
+Run `ffmpeg.exe -L` or `ffprobe.exe -L` to view the bundled executable license text.
+
+Project links:
+
+- FFmpeg: https://ffmpeg.org/
+- Gyan FFmpeg Windows builds: https://www.gyan.dev/ffmpeg/builds/
+- GyanD/codexffmpeg releases: https://github.com/GyanD/codexffmpeg/releases

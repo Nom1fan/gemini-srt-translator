@@ -1,4 +1,6 @@
 *.zip
+ffmpeg.exe
+ffprobe.exe
 *.log
 *.tmp
 *.bak

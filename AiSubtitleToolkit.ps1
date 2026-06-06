@@ -1,5 +1,6 @@
 param(
     [switch]$WorkerMode,
+    [switch]$ExtractWorkerMode,
     [switch]$MockWorkerMode,
     [switch]$RunSelfTests,
     [string]$InputPath,
@@ -16,11 +17,15 @@ Add-Type -AssemblyName System.Security
 
 $ErrorActionPreference = 'Stop'
 
-$AppName = 'Gemini SRT Translator'
-$ConfigDir = Join-Path $env:APPDATA 'GeminiSrtTranslator'
+$AppName = 'AI Subtitle Toolkit'
+$ConfigDir = Join-Path $env:APPDATA 'AiSubtitleToolkit'
+$LegacyConfigDir = Join-Path $env:APPDATA 'GeminiSrtTranslator'
 $KeyFile = Join-Path $ConfigDir 'key.bin'
+$LegacyKeyFile = Join-Path $LegacyConfigDir 'key.bin'
 $ModelName = 'gemini-3.5-flash'
 $ChunkSize = 20
+$VideoExtensions = @('.mkv', '.mp4', '.avi', '.mov', '.m4v', '.webm')
+$TextSubtitleCodecs = @('subrip', 'ass', 'ssa', 'mov_text', 'webvtt', 'text')
 
 $RLM = [char]0x200F
 $LRI = [char]0x2066
@@ -31,6 +36,15 @@ function Ensure-ConfigDir {
     if (-not (Test-Path -LiteralPath $ConfigDir)) {
         New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
     }
+}
+
+function Ensure-KeyMigration {
+    if ((Test-Path -LiteralPath $KeyFile) -or -not (Test-Path -LiteralPath $LegacyKeyFile)) {
+        return
+    }
+
+    Ensure-ConfigDir
+    Copy-Item -LiteralPath $LegacyKeyFile -Destination $KeyFile -Force
 }
 
 function Save-ApiKey {
@@ -47,6 +61,7 @@ function Save-ApiKey {
 }
 
 function Load-ApiKey {
+    Ensure-KeyMigration
     if (-not (Test-Path -LiteralPath $KeyFile)) {
         return $null
     }
@@ -87,7 +102,7 @@ How to get an API key:
 6. Paste it below and click Save.
 
 The key is saved encrypted for your Windows user in:
-%APPDATA%\GeminiSrtTranslator\key.bin
+%APPDATA%\AiSubtitleToolkit\key.bin
 
 It will be loaded automatically on future runs.
 "@
@@ -430,7 +445,7 @@ function Read-WorkerResultFile {
         throw "Worker result file is missing: $ResultFilePath"
     }
 
-    $output = ([System.IO.File]::ReadAllText($ResultFilePath, [System.Text.Encoding]::UTF8)).Trim()
+    $output = (Read-TextFileShared $ResultFilePath).Trim()
     if (-not $output) {
         throw "Worker result file is empty: $ResultFilePath"
     }
@@ -459,6 +474,296 @@ function Format-ErrorDetails {
     }
 
     return ($lines -join "`n")
+}
+
+function Test-SrtFilePath {
+    param([string]$Path)
+    return [System.IO.Path]::GetExtension($Path).Equals('.srt', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-VideoFilePath {
+    param([string]$Path)
+    $extension = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    return $VideoExtensions -contains $extension
+}
+
+function Resolve-ToolPath {
+    param([string]$ToolName)
+
+    $localTool = Join-Path $PSScriptRoot "$ToolName.exe"
+    if (Test-Path -LiteralPath $localTool) {
+        return $localTool
+    }
+
+    $command = Get-Command "$ToolName.exe" -ErrorAction SilentlyContinue
+    if (-not $command) {
+        $command = Get-Command $ToolName -ErrorAction SilentlyContinue
+    }
+    if ($command) {
+        return $command.Source
+    }
+
+    throw "$ToolName was not found. Install ffmpeg, or place $ToolName.exe next to this script."
+}
+
+function Get-ExtractedSubtitlePath {
+    param([string]$VideoPath)
+
+    $dir = Split-Path -Parent $VideoPath
+    $name = [System.IO.Path]::GetFileNameWithoutExtension($VideoPath)
+    return Join-Path $dir "$name.eng.srt"
+}
+
+function Get-EnglishTextSubtitleStream {
+    param([object[]]$Streams)
+
+    $textStreams = @($Streams | Where-Object {
+        $_.codec_type -eq 'subtitle' -and ($TextSubtitleCodecs -contains ([string]$_.codec_name).ToLowerInvariant())
+    })
+    if ($textStreams.Count -eq 0) {
+        return $null
+    }
+
+    $englishStreams = @($textStreams | Where-Object {
+        $language = ''
+        $title = ''
+        if ($_.tags) {
+            $language = [string]$_.tags.language
+            $title = [string]$_.tags.title
+        }
+        $language -match '^(?i:eng|en|en[-_].*)$' -or $title -match '(?i)english'
+    })
+
+    if ($englishStreams.Count -gt 0) {
+        return $englishStreams[0]
+    }
+
+    return $textStreams[0]
+}
+
+function Invoke-NativeTool {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments
+    )
+
+    $output = New-Object System.Collections.Generic.List[string]
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $FilePath @Arguments 2>&1 | ForEach-Object {
+            $output.Add([string]$_)
+        }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = @($output)
+    }
+}
+
+function Extract-EnglishSubtitleFromVideo {
+    param(
+        [string]$VideoPath,
+        [scriptblock]$Log
+    )
+
+    $outputPath = Get-ExtractedSubtitlePath $VideoPath
+    if (Test-Path -LiteralPath $outputPath) {
+        $existingFile = Get-Item -LiteralPath $outputPath
+        if ($existingFile.Length -gt 0) {
+            & $Log "Using existing extracted subtitle: $outputPath"
+            return $outputPath
+        }
+
+        & $Log "Removing incomplete extracted subtitle: $outputPath"
+        Remove-Item -LiteralPath $outputPath -Force
+    }
+
+    $ffprobe = Resolve-ToolPath 'ffprobe'
+    $ffmpeg = Resolve-ToolPath 'ffmpeg'
+
+    & $Log 'Inspecting embedded subtitle streams...'
+    $probeResult = Invoke-NativeTool -FilePath $ffprobe -Arguments @(
+        '-v', 'error',
+        '-print_format', 'json',
+        '-show_streams',
+        '-select_streams', 's',
+        $VideoPath
+    )
+    if ($probeResult.ExitCode -ne 0) {
+        $probeError = (($probeResult.Output | Select-Object -Last 10) -join "`n").Trim()
+        if (-not $probeError) {
+            $probeError = 'ffprobe failed while inspecting the video.'
+        }
+        throw $probeError
+    }
+
+    $probe = ($probeResult.Output -join "`n") | ConvertFrom-Json
+    $streams = @($probe.streams)
+    if ($streams.Count -eq 0) {
+        throw 'No embedded subtitle streams were found in this video.'
+    }
+
+    $stream = Get-EnglishTextSubtitleStream $streams
+    if (-not $stream) {
+        throw 'No extractable text subtitle streams were found. Bitmap/image subtitles are not supported.'
+    }
+
+    $codec = [string]$stream.codec_name
+    $language = ''
+    if ($stream.tags) {
+        $language = [string]$stream.tags.language
+    }
+    if (-not $language) {
+        $language = 'unknown language'
+    }
+
+    $tempOutputPath = "$outputPath.extracting"
+    if (Test-Path -LiteralPath $tempOutputPath) {
+        Remove-Item -LiteralPath $tempOutputPath -Force
+    }
+
+    & $Log "Extracting subtitle stream $($stream.index) ($codec, $language) to $outputPath..."
+    $extractResult = Invoke-NativeTool -FilePath $ffmpeg -Arguments @(
+        '-nostdin',
+        '-y',
+        '-hide_banner',
+        '-i', $VideoPath,
+        '-vn',
+        '-an',
+        '-dn',
+        '-map', "0:$($stream.index)",
+        '-c:s', 'srt',
+        '-f', 'srt',
+        $tempOutputPath
+    )
+    foreach ($line in $extractResult.Output) {
+        $line = [string]$line
+        if ($line -match 'Stream mapping|Subtitle:|->|Error|Invalid|failed') {
+            & $Log $line.Trim()
+        }
+    }
+
+    $tempOutputExists = Test-Path -LiteralPath $tempOutputPath
+    $tempOutputHasContent = $false
+    if ($tempOutputExists) {
+        $tempOutputHasContent = (Get-Item -LiteralPath $tempOutputPath).Length -gt 0
+    }
+
+    if ($extractResult.ExitCode -ne 0 -or -not $tempOutputHasContent) {
+        $extractError = (($extractResult.Output | Select-Object -Last 12) -join "`n").Trim()
+        if (-not $extractError) {
+            $extractError = 'ffmpeg failed while extracting the subtitle stream.'
+        }
+        if ($tempOutputExists) {
+            Remove-Item -LiteralPath $tempOutputPath -Force -ErrorAction SilentlyContinue
+        }
+        throw $extractError
+    }
+
+    Move-Item -LiteralPath $tempOutputPath -Destination $outputPath -Force
+    return $outputPath
+}
+
+function Resolve-SubtitleInputPath {
+    param(
+        [string]$InputPath,
+        [scriptblock]$Log
+    )
+
+    if (Test-SrtFilePath $InputPath) {
+        return $InputPath
+    }
+
+    if (Test-VideoFilePath $InputPath) {
+        return Extract-EnglishSubtitleFromVideo -VideoPath $InputPath -Log $Log
+    }
+
+    throw 'Please select an .srt subtitle file or a supported video file.'
+}
+
+function Read-TextFileShared {
+    param([string]$Path)
+
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::ReadWrite
+            )
+            try {
+                $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+                try {
+                    return $reader.ReadToEnd()
+                } finally {
+                    $reader.Dispose()
+                }
+            } finally {
+                $stream.Dispose()
+            }
+        } catch {
+            if ($attempt -eq 20) {
+                throw
+            }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
+function Try-ReadTextFileShared {
+    param([string]$Path)
+
+    try {
+        return Read-TextFileShared $Path
+    } catch {
+        return $null
+    }
+}
+
+function Add-TextFileLineShared {
+    param(
+        [string]$Path,
+        [string]$Line
+    )
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Line + [Environment]::NewLine)
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Append,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite
+            )
+            try {
+                $stream.Write($bytes, 0, $bytes.Length)
+                $stream.Flush()
+                return
+            } finally {
+                $stream.Dispose()
+            }
+        } catch {
+            if ($attempt -eq 20) {
+                throw
+            }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
+function Write-WorkerLog {
+    param(
+        [string]$Path,
+        [string]$Message
+    )
+
+    Add-TextFileLineShared -Path $Path -Line "[$(Get-Date -Format HH:mm:ss)] $Message"
 }
 
 function Translate-SrtFile {
@@ -550,7 +855,7 @@ function Invoke-WorkerMode {
 
         $writeLog = {
             param([string]$Message)
-            Add-Content -LiteralPath $LogFile -Value "[$(Get-Date -Format HH:mm:ss)] $Message" -Encoding UTF8
+            Write-WorkerLog -Path $LogFile -Message $Message
         }
 
         $writeProgress = {
@@ -558,8 +863,18 @@ function Invoke-WorkerMode {
             [System.IO.File]::WriteAllText($ProgressFile, [string][Math]::Max(0, [Math]::Min(100, $Value)))
         }
 
+        $subtitleInputPath = Resolve-SubtitleInputPath -InputPath $InputPath -Log $writeLog
+        if ($subtitleInputPath -ne $InputPath) {
+            & $writeLog "Subtitle input: $subtitleInputPath"
+        }
+
+        $directionCheck = Test-TranslationDirectionLooksValid -InputPath $subtitleInputPath -Direction $Direction
+        if (-not $directionCheck.IsValid) {
+            throw $directionCheck.Message
+        }
+
         $output = Translate-SrtFile `
-            -InputPath $InputPath `
+            -InputPath $subtitleInputPath `
             -Direction $Direction `
             -ApiKey $apiKey `
             -Log $writeLog `
@@ -571,7 +886,38 @@ function Invoke-WorkerMode {
         exit 0
     } catch {
         $details = Format-ErrorDetails $_
-        Add-Content -LiteralPath $LogFile -Value "[$(Get-Date -Format HH:mm:ss)] $details" -Encoding UTF8
+        Write-WorkerLog -Path $LogFile -Message $details
+        [System.IO.File]::WriteAllText($DoneFile, "ERROR`n$details", [System.Text.Encoding]::UTF8)
+        exit 1
+    }
+}
+
+function Invoke-ExtractWorkerMode {
+    try {
+        $writeLog = {
+            param([string]$Message)
+            Write-WorkerLog -Path $LogFile -Message $Message
+        }
+
+        $writeProgress = {
+            param([int]$Value)
+            [System.IO.File]::WriteAllText($ProgressFile, [string][Math]::Max(0, [Math]::Min(100, $Value)))
+        }
+
+        if (-not (Test-VideoFilePath $InputPath)) {
+            throw 'Extract requires a supported video file: .mkv, .mp4, .avi, .mov, .m4v, .webm.'
+        }
+
+        & $writeProgress 5
+        $output = Extract-EnglishSubtitleFromVideo -VideoPath $InputPath -Log $writeLog
+        & $writeProgress 100
+
+        [System.IO.File]::WriteAllText($ResultFile, $output, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($DoneFile, 'OK', [System.Text.Encoding]::UTF8)
+        exit 0
+    } catch {
+        $details = Format-ErrorDetails $_
+        Write-WorkerLog -Path $LogFile -Message $details
         [System.IO.File]::WriteAllText($DoneFile, "ERROR`n$details", [System.Text.Encoding]::UTF8)
         exit 1
     }
@@ -579,20 +925,20 @@ function Invoke-WorkerMode {
 
 function Invoke-MockWorkerMode {
     try {
-        Add-Content -LiteralPath $LogFile -Value "[$(Get-Date -Format HH:mm:ss)] Parsed 40 subtitle blocks." -Encoding UTF8
+        Write-WorkerLog -Path $LogFile -Message 'Parsed 40 subtitle blocks.'
         [System.IO.File]::WriteAllText($ProgressFile, '0', [System.Text.Encoding]::UTF8)
         Start-Sleep -Milliseconds 300
-        Add-Content -LiteralPath $LogFile -Value "[$(Get-Date -Format HH:mm:ss)] Translating blocks 1-20..." -Encoding UTF8
+        Write-WorkerLog -Path $LogFile -Message 'Translating blocks 1-20...'
         [System.IO.File]::WriteAllText($ProgressFile, '50', [System.Text.Encoding]::UTF8)
         Start-Sleep -Milliseconds 300
-        Add-Content -LiteralPath $LogFile -Value "[$(Get-Date -Format HH:mm:ss)] Translating blocks 21-40..." -Encoding UTF8
+        Write-WorkerLog -Path $LogFile -Message 'Translating blocks 21-40...'
         [System.IO.File]::WriteAllText($ProgressFile, '100', [System.Text.Encoding]::UTF8)
         [System.IO.File]::WriteAllText($ResultFile, 'C:\Temp\translated.eng.srt', [System.Text.Encoding]::UTF8)
         [System.IO.File]::WriteAllText($DoneFile, 'OK', [System.Text.Encoding]::UTF8)
         exit 0
     } catch {
         $details = Format-ErrorDetails $_
-        Add-Content -LiteralPath $LogFile -Value "[$(Get-Date -Format HH:mm:ss)] $details" -Encoding UTF8
+        Write-WorkerLog -Path $LogFile -Message $details
         [System.IO.File]::WriteAllText($DoneFile, "ERROR`n$details", [System.Text.Encoding]::UTF8)
         exit 1
     }
@@ -631,6 +977,32 @@ function Invoke-SelfTests {
     try {
         Assert-Equal (Get-OutputPath (Join-Path $tmp 'episode.heb.srt') 'Hebrew to English') (Join-Path $tmp 'episode.eng.srt') 'Hebrew output path'
         Assert-Equal (Get-OutputPath (Join-Path $tmp 'episode.en.srt') 'English to Hebrew') (Join-Path $tmp 'episode.heb.srt') 'English output path'
+        Assert-True (Test-SrtFilePath (Join-Path $tmp 'episode.srt')) 'SRT path detection'
+        Assert-True (Test-VideoFilePath (Join-Path $tmp 'episode.mkv')) 'Video path detection'
+        Assert-Equal (Get-ExtractedSubtitlePath (Join-Path $tmp 'episode.mkv')) (Join-Path $tmp 'episode.eng.srt') 'Extracted subtitle output path'
+
+        $streams = @(
+            [pscustomobject]@{
+                index = 2
+                codec_type = 'subtitle'
+                codec_name = 'hdmv_pgs_subtitle'
+                tags = [pscustomobject]@{ language = 'eng'; title = 'English PGS' }
+            },
+            [pscustomobject]@{
+                index = 3
+                codec_type = 'subtitle'
+                codec_name = 'subrip'
+                tags = [pscustomobject]@{ language = 'jpn'; title = 'Japanese' }
+            },
+            [pscustomobject]@{
+                index = 4
+                codec_type = 'subtitle'
+                codec_name = 'ass'
+                tags = [pscustomobject]@{ language = 'eng'; title = 'English signs' }
+            }
+        )
+        $selectedStream = Get-EnglishTextSubtitleStream $streams
+        Assert-Equal $selectedStream.index 4 'English text stream selection'
 
         $knownAsL = -join @(
             [char]0x05D9, [char]0x05D3, [char]0x05D5, [char]0x05E2,
@@ -706,6 +1078,19 @@ function Invoke-SelfTests {
         Assert-ThrowsLike { Read-WorkerResultFile '' } 'path is empty' 'Empty worker result path'
         Assert-ThrowsLike { Read-WorkerResultFile (Join-Path $tmp 'missing.txt') } 'is missing' 'Missing worker result path'
 
+        $sharedReadPath = Join-Path $tmp 'shared-log.txt'
+        $sharedStream = [System.IO.File]::Open($sharedReadPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes('shared log line')
+            $sharedStream.Write($bytes, 0, $bytes.Length)
+            $sharedStream.Flush()
+            Assert-Equal (Read-TextFileShared $sharedReadPath) 'shared log line' 'Shared log reader'
+            Write-WorkerLog -Path $sharedReadPath -Message 'second line'
+            Assert-True ((Read-TextFileShared $sharedReadPath) -match 'second line') 'Shared log writer'
+        } finally {
+            $sharedStream.Dispose()
+        }
+
         'SELFTEST_OK'
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -777,68 +1162,83 @@ function Show-MainForm {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = $AppName
     $form.StartPosition = 'CenterScreen'
-    $form.Size = New-Object System.Drawing.Size(720, 520)
-    $form.MinimumSize = New-Object System.Drawing.Size(720, 520)
+    $form.Size = New-Object System.Drawing.Size(820, 520)
+    $form.MinimumSize = New-Object System.Drawing.Size(820, 520)
+
+    $hintLabel = New-Object System.Windows.Forms.Label
+    $hintLabel.Location = New-Object System.Drawing.Point(16, 12)
+    $hintLabel.Size = New-Object System.Drawing.Size(770, 34)
+    $hintLabel.Text = "* Select a video file to extract an SRT from it.`r`n* Select an SRT to translate."
+    $form.Controls.Add($hintLabel)
 
     $fileLabel = New-Object System.Windows.Forms.Label
-    $fileLabel.Location = New-Object System.Drawing.Point(16, 20)
+    $fileLabel.Location = New-Object System.Drawing.Point(16, 56)
     $fileLabel.Size = New-Object System.Drawing.Size(90, 24)
-    $fileLabel.Text = 'SRT file:'
+    $fileLabel.Text = 'Input file:'
     $form.Controls.Add($fileLabel)
 
     $fileText = New-Object System.Windows.Forms.TextBox
-    $fileText.Location = New-Object System.Drawing.Point(110, 18)
-    $fileText.Size = New-Object System.Drawing.Size(465, 24)
+    $fileText.Location = New-Object System.Drawing.Point(110, 54)
+    $fileText.Size = New-Object System.Drawing.Size(565, 24)
     $form.Controls.Add($fileText)
 
     $browseButton = New-Object System.Windows.Forms.Button
-    $browseButton.Location = New-Object System.Drawing.Point(590, 16)
+    $browseButton.Location = New-Object System.Drawing.Point(690, 52)
     $browseButton.Size = New-Object System.Drawing.Size(95, 28)
     $browseButton.Text = 'Browse...'
     $form.Controls.Add($browseButton)
 
     $directionLabel = New-Object System.Windows.Forms.Label
-    $directionLabel.Location = New-Object System.Drawing.Point(16, 62)
+    $directionLabel.Location = New-Object System.Drawing.Point(16, 98)
     $directionLabel.Size = New-Object System.Drawing.Size(90, 24)
     $directionLabel.Text = 'Direction:'
     $form.Controls.Add($directionLabel)
 
     $directionCombo = New-Object System.Windows.Forms.ComboBox
-    $directionCombo.Location = New-Object System.Drawing.Point(110, 60)
+    $directionCombo.Location = New-Object System.Drawing.Point(110, 96)
     $directionCombo.Size = New-Object System.Drawing.Size(220, 24)
     $directionCombo.DropDownStyle = 'DropDownList'
     [void]$directionCombo.Items.Add('Hebrew to English')
     [void]$directionCombo.Items.Add('English to Hebrew')
     $directionCombo.SelectedIndex = 0
+    $directionCombo.Enabled = $false
     $form.Controls.Add($directionCombo)
 
+    $extractButton = New-Object System.Windows.Forms.Button
+    $extractButton.Location = New-Object System.Drawing.Point(350, 93)
+    $extractButton.Size = New-Object System.Drawing.Size(95, 32)
+    $extractButton.Text = 'Extract'
+    $extractButton.Enabled = $false
+    $form.Controls.Add($extractButton)
+
     $translateButton = New-Object System.Windows.Forms.Button
-    $translateButton.Location = New-Object System.Drawing.Point(350, 57)
-    $translateButton.Size = New-Object System.Drawing.Size(110, 32)
+    $translateButton.Location = New-Object System.Drawing.Point(460, 93)
+    $translateButton.Size = New-Object System.Drawing.Size(95, 32)
     $translateButton.Text = 'Translate'
+    $translateButton.Enabled = $false
     $form.Controls.Add($translateButton)
 
     $cancelButton = New-Object System.Windows.Forms.Button
-    $cancelButton.Location = New-Object System.Drawing.Point(475, 57)
+    $cancelButton.Location = New-Object System.Drawing.Point(570, 93)
     $cancelButton.Size = New-Object System.Drawing.Size(90, 32)
     $cancelButton.Text = 'Cancel'
     $cancelButton.Enabled = $false
     $form.Controls.Add($cancelButton)
 
     $resetKeyButton = New-Object System.Windows.Forms.Button
-    $resetKeyButton.Location = New-Object System.Drawing.Point(580, 57)
+    $resetKeyButton.Location = New-Object System.Drawing.Point(675, 93)
     $resetKeyButton.Size = New-Object System.Drawing.Size(110, 32)
     $resetKeyButton.Text = 'Reset API Key'
     $form.Controls.Add($resetKeyButton)
 
     $progress = New-Object System.Windows.Forms.ProgressBar
-    $progress.Location = New-Object System.Drawing.Point(16, 105)
-    $progress.Size = New-Object System.Drawing.Size(670, 22)
+    $progress.Location = New-Object System.Drawing.Point(16, 141)
+    $progress.Size = New-Object System.Drawing.Size(770, 22)
     $form.Controls.Add($progress)
 
     $logBox = New-Object System.Windows.Forms.TextBox
-    $logBox.Location = New-Object System.Drawing.Point(16, 145)
-    $logBox.Size = New-Object System.Drawing.Size(670, 315)
+    $logBox.Location = New-Object System.Drawing.Point(16, 181)
+    $logBox.Size = New-Object System.Drawing.Size(770, 279)
     $logBox.Multiline = $true
     $logBox.ScrollBars = 'Vertical'
     $logBox.ReadOnly = $true
@@ -869,12 +1269,28 @@ function Show-MainForm {
     $script:currentResultFile = $null
     $script:currentDoneFile = $null
 
+    $updateInputButtons = {
+        $path = $fileText.Text.Trim()
+        $hasExistingPath = $path -and (Test-Path -LiteralPath $path)
+        $extractButton.Enabled = $hasExistingPath -and (Test-VideoFilePath $path)
+        $translateButton.Enabled = $hasExistingPath -and (Test-SrtFilePath $path)
+        $directionCombo.Enabled = $translateButton.Enabled
+    }
+
+    $fileText.Add_TextChanged({
+        & $updateInputButtons
+    })
+
     $browseButton.Add_Click({
         $dialog = New-Object System.Windows.Forms.OpenFileDialog
-        $dialog.Filter = 'SRT subtitles (*.srt)|*.srt|All files (*.*)|*.*'
-        $dialog.Title = 'Select SRT file'
+        $dialog.Filter = 'Subtitles and videos (*.srt;*.mkv;*.mp4;*.avi;*.mov;*.m4v;*.webm)|*.srt;*.mkv;*.mp4;*.avi;*.mov;*.m4v;*.webm|SRT subtitles (*.srt)|*.srt|Video files (*.mkv;*.mp4;*.avi;*.mov;*.m4v;*.webm)|*.mkv;*.mp4;*.avi;*.mov;*.m4v;*.webm|All files (*.*)|*.*'
+        $dialog.Title = 'Select subtitle or video file'
         if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             $fileText.Text = $dialog.FileName
+            if (Test-VideoFilePath $dialog.FileName) {
+                $directionCombo.SelectedItem = 'English to Hebrew'
+            }
+            & $updateInputButtons
         }
     })
 
@@ -910,7 +1326,7 @@ function Show-MainForm {
         }
         $cancelButton.Enabled = $false
         $cancelButton.Text = 'Cancel'
-        $translateButton.Enabled = $true
+        & $updateInputButtons
         $browseButton.Enabled = $true
         $resetKeyButton.Enabled = $true
         $script:currentProcess = $null
@@ -918,11 +1334,221 @@ function Show-MainForm {
         & $appendLog 'Canceled.'
                 [System.Windows.Forms.MessageBox]::Show(
                     $form,
-                    'Translation canceled. No output file was written.',
+                    'Operation canceled. No output file was written.',
                     $AppName,
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+    })
+
+    $startWorkerOperation = {
+        param(
+            [string[]]$WorkerArguments,
+            [string[]]$InitialLogLines
+        )
+
+        $extractButton.Enabled = $false
+        $translateButton.Enabled = $false
+        $browseButton.Enabled = $false
+        $resetKeyButton.Enabled = $false
+        $cancelButton.Enabled = $true
+        $cancelButton.Text = 'Cancel'
+        $progress.Value = 0
+        $logBox.Clear()
+
+        foreach ($line in $InitialLogLines) {
+            & $appendLog $line
+        }
+
+        Ensure-ConfigDir
+        $jobsDir = Join-Path $ConfigDir 'jobs'
+        if (-not (Test-Path -LiteralPath $jobsDir)) {
+            New-Item -ItemType Directory -Path $jobsDir -Force | Out-Null
+        }
+
+        $script:currentJobDir = Join-Path $jobsDir ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:currentJobDir -Force | Out-Null
+
+        $script:currentLogFile = Join-Path $script:currentJobDir 'log.txt'
+        $script:currentProgressFile = Join-Path $script:currentJobDir 'progress.txt'
+        $script:currentResultFile = Join-Path $script:currentJobDir 'result.txt'
+        $script:currentDoneFile = Join-Path $script:currentJobDir 'done.txt'
+        [System.IO.File]::WriteAllText($script:currentLogFile, '', [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($script:currentProgressFile, '0', [System.Text.Encoding]::UTF8)
+        $script:logReadLength = 0
+        $script:cancelRequested = $false
+
+        $powershellExe = (Get-Command powershell.exe).Source
+        $arguments = @(
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', (Quote-ProcessArgument $PSCommandPath)
+        ) + $WorkerArguments + @(
+            '-LogFile', (Quote-ProcessArgument $script:currentLogFile),
+            '-ProgressFile', (Quote-ProcessArgument $script:currentProgressFile),
+            '-ResultFile', (Quote-ProcessArgument $script:currentResultFile),
+            '-DoneFile', (Quote-ProcessArgument $script:currentDoneFile)
+        )
+
+        $script:currentProcess = Start-Process `
+            -FilePath $powershellExe `
+            -ArgumentList ($arguments -join ' ') `
+            -WindowStyle Hidden `
+            -PassThru
+
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 500
+        $script:currentTimer = $timer
+        $timer.Add_Tick({
+            try {
+                if (Test-Path -LiteralPath $script:currentLogFile) {
+                    $logText = Try-ReadTextFileShared $script:currentLogFile
+                    if ($null -ne $logText -and $logText.Length -gt $script:logReadLength) {
+                        $logBox.AppendText($logText.Substring($script:logReadLength).Replace("`n", "`r`n"))
+                        $script:logReadLength = $logText.Length
+                    }
+                }
+
+                if (Test-Path -LiteralPath $script:currentProgressFile) {
+                    $progressRawText = Try-ReadTextFileShared $script:currentProgressFile
+                    if ($null -eq $progressRawText) {
+                        return
+                    }
+                    $progressText = $progressRawText.Trim()
+                    $progressValue = 0
+                    if ([int]::TryParse($progressText, [ref]$progressValue)) {
+                        & $setProgress $progressValue
+                    }
+                }
+
+                $finished = (Test-Path -LiteralPath $script:currentDoneFile) -or ($script:currentProcess -and $script:currentProcess.HasExited)
+                if (-not $finished) {
+                    return
+                }
+
+                if ($script:currentTimer) {
+                    $script:currentTimer.Stop()
+                    $script:currentTimer.Dispose()
+                }
+                $script:currentTimer = $null
+
+                if ($script:cancelRequested) {
+                    & $appendLog 'Canceled.'
+                    [System.Windows.Forms.MessageBox]::Show(
+                        $form,
+                        'Operation canceled. No output file was written.',
+                        $AppName,
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Information
+                    ) | Out-Null
+                } elseif (Test-Path -LiteralPath $script:currentDoneFile) {
+                    $doneText = Try-ReadTextFileShared $script:currentDoneFile
+                    if ($null -eq $doneText) {
+                        return
+                    }
+                    if ($doneText.StartsWith('OK')) {
+                        & $setProgress 100
+                        $output = Read-WorkerResultFile $script:currentResultFile
+                        & $appendLog "Done: $output"
+                        Show-CompletionDialog -OutputPath $output -Owner $form
+                    } else {
+                        $message = ($doneText -replace '^ERROR\s*', '').Trim()
+                        if (-not $message) {
+                            $message = 'Operation failed.'
+                        }
+                        & $appendLog "Error: $message"
+                        [System.Windows.Forms.MessageBox]::Show(
+                            $form,
+                            $message,
+                            $AppName,
+                            [System.Windows.Forms.MessageBoxButtons]::OK,
+                            [System.Windows.Forms.MessageBoxIcon]::Error
+                        ) | Out-Null
+                    }
+                } else {
+                    & $appendLog 'Error: worker process exited unexpectedly.'
+                    [System.Windows.Forms.MessageBox]::Show(
+                        $form,
+                        'Worker process exited unexpectedly.',
+                        $AppName,
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Error
+                    ) | Out-Null
+                }
+
+                & $updateInputButtons
+                $browseButton.Enabled = $true
+                $resetKeyButton.Enabled = $true
+                $cancelButton.Enabled = $false
+                $cancelButton.Text = 'Cancel'
+                $script:currentProcess = $null
+            } catch {
+                & $appendLog (Format-ErrorDetails $_)
+                if ($script:currentTimer) {
+                    $script:currentTimer.Stop()
+                    $script:currentTimer.Dispose()
+                    $script:currentTimer = $null
+                }
+                & $updateInputButtons
+                $browseButton.Enabled = $true
+                $resetKeyButton.Enabled = $true
+                $cancelButton.Enabled = $false
+                $cancelButton.Text = 'Cancel'
+                $script:currentProcess = $null
+            }
+        })
+        $timer.Start()
+    }
+
+    $extractButton.Add_Click({
+        try {
+            $inputPath = $fileText.Text.Trim()
+            if (-not $inputPath -or -not (Test-Path -LiteralPath $inputPath)) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    $form,
+                    'Please select an existing video file.',
+                    $AppName,
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning
                 ) | Out-Null
+                return
+            }
+
+            if (-not (Test-VideoFilePath $inputPath)) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    $form,
+                    'Extract requires one of these video formats: .mkv, .mp4, .avi, .mov, .m4v, .webm.',
+                    $AppName,
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning
+                ) | Out-Null
+                return
+            }
+
+            & $startWorkerOperation `
+                @(
+                    '-ExtractWorkerMode',
+                    '-InputPath', (Quote-ProcessArgument $inputPath)
+                ) `
+                @(
+                    "Input: $inputPath",
+                    'Mode: extract embedded English subtitles only.'
+                )
+        } catch {
+            & $updateInputButtons
+            $browseButton.Enabled = $true
+            $resetKeyButton.Enabled = $true
+            $cancelButton.Enabled = $false
+            $cancelButton.Text = 'Cancel'
+            & $appendLog "Error: $($_.Exception.Message)"
+            [System.Windows.Forms.MessageBox]::Show(
+                $form,
+                $_.Exception.Message,
+                $AppName,
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+        }
     })
 
     $translateButton.Add_Click({
@@ -931,7 +1557,7 @@ function Show-MainForm {
             if (-not $inputPath -or -not (Test-Path -LiteralPath $inputPath)) {
                 [System.Windows.Forms.MessageBox]::Show(
                     $form,
-                    'Please select an existing .srt file.',
+                    'Please select an existing .srt subtitle file.',
                     $AppName,
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -945,11 +1571,10 @@ function Show-MainForm {
             }
 
             $direction = [string]$directionCombo.SelectedItem
-            $directionCheck = Test-TranslationDirectionLooksValid -InputPath $inputPath -Direction $direction
-            if (-not $directionCheck.IsValid) {
+            if (-not (Test-SrtFilePath $inputPath)) {
                 [System.Windows.Forms.MessageBox]::Show(
                     $form,
-                    $directionCheck.Message,
+                    'Translate requires an .srt subtitle file. Select a video file and click Extract first.',
                     $AppName,
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -957,150 +1582,19 @@ function Show-MainForm {
                 return
             }
 
-            $translateButton.Enabled = $false
-            $browseButton.Enabled = $false
-            $resetKeyButton.Enabled = $false
-            $cancelButton.Enabled = $true
-            $cancelButton.Text = 'Cancel'
-            $progress.Value = 0
-            $logBox.Clear()
-
-            & $appendLog "Input: $inputPath"
-            & $appendLog "Direction: $direction"
-
-            Ensure-ConfigDir
-            $jobsDir = Join-Path $ConfigDir 'jobs'
-            if (-not (Test-Path -LiteralPath $jobsDir)) {
-                New-Item -ItemType Directory -Path $jobsDir -Force | Out-Null
-            }
-
-            $script:currentJobDir = Join-Path $jobsDir ([guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Path $script:currentJobDir -Force | Out-Null
-
-            $script:currentLogFile = Join-Path $script:currentJobDir 'log.txt'
-            $script:currentProgressFile = Join-Path $script:currentJobDir 'progress.txt'
-            $script:currentResultFile = Join-Path $script:currentJobDir 'result.txt'
-            $script:currentDoneFile = Join-Path $script:currentJobDir 'done.txt'
-            [System.IO.File]::WriteAllText($script:currentLogFile, '', [System.Text.Encoding]::UTF8)
-            [System.IO.File]::WriteAllText($script:currentProgressFile, '0', [System.Text.Encoding]::UTF8)
-            $script:logReadLength = 0
-            $script:cancelRequested = $false
-
-            $powershellExe = (Get-Command powershell.exe).Source
-            $arguments = @(
-                '-NoProfile',
-                '-ExecutionPolicy', 'Bypass',
-                '-File', (Quote-ProcessArgument $PSCommandPath),
-                '-WorkerMode',
-                '-InputPath', (Quote-ProcessArgument $inputPath),
-                '-Direction', (Quote-ProcessArgument $direction),
-                '-LogFile', (Quote-ProcessArgument $script:currentLogFile),
-                '-ProgressFile', (Quote-ProcessArgument $script:currentProgressFile),
-                '-ResultFile', (Quote-ProcessArgument $script:currentResultFile),
-                '-DoneFile', (Quote-ProcessArgument $script:currentDoneFile)
-            ) -join ' '
-
-            $script:currentProcess = Start-Process `
-                -FilePath $powershellExe `
-                -ArgumentList $arguments `
-                -WindowStyle Hidden `
-                -PassThru
-
-            $timer = New-Object System.Windows.Forms.Timer
-            $timer.Interval = 500
-            $script:currentTimer = $timer
-            $timer.Add_Tick({
-                try {
-                    if (Test-Path -LiteralPath $script:currentLogFile) {
-                        $logText = [System.IO.File]::ReadAllText($script:currentLogFile)
-                        if ($logText.Length -gt $script:logReadLength) {
-                            $logBox.AppendText($logText.Substring($script:logReadLength).Replace("`n", "`r`n"))
-                            $script:logReadLength = $logText.Length
-                        }
-                    }
-
-                    if (Test-Path -LiteralPath $script:currentProgressFile) {
-                        $progressText = ([System.IO.File]::ReadAllText($script:currentProgressFile)).Trim()
-                        $progressValue = 0
-                        if ([int]::TryParse($progressText, [ref]$progressValue)) {
-                            & $setProgress $progressValue
-                        }
-                    }
-
-                    $finished = (Test-Path -LiteralPath $script:currentDoneFile) -or ($script:currentProcess -and $script:currentProcess.HasExited)
-                    if (-not $finished) {
-                        return
-                    }
-
-                    $timer.Stop()
-                    $timer.Dispose()
-                    $script:currentTimer = $null
-
-                    if ($script:cancelRequested) {
-                        & $appendLog 'Canceled.'
-                        [System.Windows.Forms.MessageBox]::Show(
-                            $form,
-                            'Translation canceled. No output file was written.',
-                            $AppName,
-                            [System.Windows.Forms.MessageBoxButtons]::OK,
-                            [System.Windows.Forms.MessageBoxIcon]::Information
-                        ) | Out-Null
-                    } elseif (Test-Path -LiteralPath $script:currentDoneFile) {
-                        $doneText = [System.IO.File]::ReadAllText($script:currentDoneFile)
-                        if ($doneText.StartsWith('OK')) {
-                            & $setProgress 100
-                            $output = Read-WorkerResultFile $script:currentResultFile
-                            & $appendLog "Done: $output"
-                            Show-CompletionDialog -OutputPath $output -Owner $form
-                        } else {
-                            $message = ($doneText -replace '^ERROR\s*', '').Trim()
-                            if (-not $message) {
-                                $message = 'Translation failed.'
-                            }
-                            & $appendLog "Error: $message"
-                            [System.Windows.Forms.MessageBox]::Show(
-                                $form,
-                                $message,
-                                $AppName,
-                                [System.Windows.Forms.MessageBoxButtons]::OK,
-                                [System.Windows.Forms.MessageBoxIcon]::Error
-                            ) | Out-Null
-                        }
-                    } else {
-                        & $appendLog 'Error: worker process exited unexpectedly.'
-                        [System.Windows.Forms.MessageBox]::Show(
-                            $form,
-                            'Translation process exited unexpectedly.',
-                            $AppName,
-                            [System.Windows.Forms.MessageBoxButtons]::OK,
-                            [System.Windows.Forms.MessageBoxIcon]::Error
-                        ) | Out-Null
-                    }
-
-                    $translateButton.Enabled = $true
-                    $browseButton.Enabled = $true
-                    $resetKeyButton.Enabled = $true
-                    $cancelButton.Enabled = $false
-                    $cancelButton.Text = 'Cancel'
-                    $script:currentProcess = $null
-                } catch {
-                    & $appendLog (Format-ErrorDetails $_)
-                    if ($script:currentTimer) {
-                        $script:currentTimer.Stop()
-                        $script:currentTimer.Dispose()
-                        $script:currentTimer = $null
-                    }
-                    $translateButton.Enabled = $true
-                    $browseButton.Enabled = $true
-                    $resetKeyButton.Enabled = $true
-                    $cancelButton.Enabled = $false
-                    $cancelButton.Text = 'Cancel'
-                    $script:currentProcess = $null
-                }
-            })
-            $timer.Start()
+            & $startWorkerOperation `
+                @(
+                    '-WorkerMode',
+                    '-InputPath', (Quote-ProcessArgument $inputPath),
+                    '-Direction', (Quote-ProcessArgument $direction)
+                ) `
+                @(
+                    "Input: $inputPath",
+                    "Direction: $direction",
+                    'Mode: translate subtitle file.'
+                )
         } catch {
-            $translateButton.Enabled = $true
+            & $updateInputButtons
             $browseButton.Enabled = $true
             $resetKeyButton.Enabled = $true
             $cancelButton.Enabled = $false
@@ -1123,8 +1617,11 @@ if ($RunSelfTests) {
     Invoke-SelfTests
 } elseif ($MockWorkerMode) {
     Invoke-MockWorkerMode
+} elseif ($ExtractWorkerMode) {
+    Invoke-ExtractWorkerMode
 } elseif ($WorkerMode) {
     Invoke-WorkerMode
 } else {
     Show-MainForm
 }
+

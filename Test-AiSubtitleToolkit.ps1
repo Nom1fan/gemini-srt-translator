@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$ScriptPath = Join-Path $PSScriptRoot 'GeminiSrtTranslator.ps1'
+$ScriptPath = Join-Path $PSScriptRoot 'AiSubtitleToolkit.ps1'
 
 function Assert-True {
     param([bool]$Condition, [string]$Name)
@@ -96,6 +96,43 @@ function Invoke-MockWorkerCancelTest {
     }
 }
 
+function Invoke-ExtractWorkerExistingSubtitleTest {
+    $dir = New-TestJobDir
+    try {
+        $input = Join-Path $dir 'movie.mkv'
+        $existingSubtitle = Join-Path $dir 'movie.eng.srt'
+        $log = Join-Path $dir 'log.txt'
+        $progress = Join-Path $dir 'progress.txt'
+        $result = Join-Path $dir 'result.txt'
+        $done = Join-Path $dir 'done.txt'
+
+        [System.IO.File]::WriteAllText($input, '', [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText(
+            $existingSubtitle,
+            "1`n00:00:01,000 --> 00:00:02,000`nHello.`n",
+            [System.Text.Encoding]::UTF8
+        )
+
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath `
+            -ExtractWorkerMode `
+            -InputPath $input `
+            -LogFile $log `
+            -ProgressFile $progress `
+            -ResultFile $result `
+            -DoneFile $done | Out-Null
+
+        Assert-True ($LASTEXITCODE -eq 0) 'extract worker exited non-zero'
+        Assert-True (Test-Path -LiteralPath $done) 'extract worker did not create done file'
+        Assert-True ((Get-Content -Raw -LiteralPath $done).StartsWith('OK')) 'extract worker did not report OK'
+        Assert-True ((Get-Content -Raw -LiteralPath $progress).Trim() -eq '100') 'extract worker did not reach 100 progress'
+        Assert-True ((Get-Content -Raw -LiteralPath $log) -match 'Using existing extracted subtitle') 'extract worker did not reuse existing subtitle'
+        Assert-True ((Get-Content -Raw -LiteralPath $result).Trim() -eq $existingSubtitle) 'extract worker result path mismatch'
+        'PASS extract worker existing subtitle'
+    } finally {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Assert-TextHasLatin {
     param([string]$Text, [string]$Name)
     Assert-True (([regex]::Matches($Text, '[A-Za-z]')).Count -ge 3) $Name
@@ -161,8 +198,9 @@ function Invoke-WetWorkerTranslationTest {
 }
 
 function Invoke-WetTests {
-    $keyFile = Join-Path (Join-Path $env:APPDATA 'GeminiSrtTranslator') 'key.bin'
-    Assert-True (Test-Path -LiteralPath $keyFile) 'wet tests require a saved Gemini API key; run the app once and save your key first'
+    $keyFile = Join-Path (Join-Path $env:APPDATA 'AiSubtitleToolkit') 'key.bin'
+    $legacyKeyFile = Join-Path (Join-Path $env:APPDATA 'GeminiSrtTranslator') 'key.bin'
+    Assert-True ((Test-Path -LiteralPath $keyFile) -or (Test-Path -LiteralPath $legacyKeyFile)) 'wet tests require a saved Gemini API key; run the app once and save your key first'
 
     $hebrewInput = -join @(
         [char]0x05D0, [char]0x05E0, [char]0x05D9, ' ',
@@ -187,6 +225,7 @@ Invoke-ParserTest
 Invoke-SelfTest
 Invoke-MockWorkerSuccessTest
 Invoke-MockWorkerCancelTest
+Invoke-ExtractWorkerExistingSubtitleTest
 if ($Wet) {
     Invoke-WetTests
 }
